@@ -37,14 +37,12 @@ function getBestSplit(amount, tiers) {
   return { best, parts: bestParts };
 }
 
-// Scan all amounts brute-force, find worst arbitrage per affected tier
 function generateRecommendations(sorted) {
   if (sorted.length < 2) return [];
 
   const maxAmt = Math.max(...sorted.map(t => t.threshold)) * 2.5;
   const step = Math.max(1000, Math.round(maxAmt / 300));
 
-  // For each tier, track worst arbitrage case in that tier's range
   const worstByTier = {};
 
   for (let amt = step; amt <= maxAmt; amt += step) {
@@ -65,19 +63,10 @@ function generateRecommendations(sorted) {
     const tier = sorted[w.tierIdx];
     const splitEffRate = w.bestDisc / w.amt;
 
-    // Fix: what discount would this tier need so that single cart always wins?
-    // At the worst amount, single cart discount must be >= best split discount
-    // For abs tier: need value >= bestDisc (but that's for worst amount; really need value >= splitEffRate * threshold for threshold, and >= bestDisc for worst amount)
-    // Simpler: set discount so that eff rate at threshold >= max split eff rate observed
     let fixVal;
     if (tier.type === "abs") {
-      // Need: tier.value / amt >= splitEffRate for all amt in range
-      // Worst case is at the highest amt in range (lowest eff for abs)
-      // But we can't set value per-amount; we need value such that even at worst amount, single >= split
-      // value >= best split discount at worst amount
       fixVal = Math.ceil(w.bestDisc);
     } else {
-      // For pct: rate >= splitEffRate * 100
       fixVal = Math.ceil(splitEffRate * 1000) / 10;
     }
 
@@ -104,6 +93,7 @@ const FONT = "'Inter', 'SF Pro Display', -apple-system, sans-serif";
 
 export default function App() {
   const [tiers, setTiers] = useState(defaults);
+  const [showExplanation, setShowExplanation] = useState(false);
 
   const updateTier = (i, field, val) => {
     const next = [...tiers];
@@ -148,7 +138,6 @@ export default function App() {
   const autoFixAll = () => {
     const next = [...tiers];
     const s = [...next].filter(t => t.threshold > 0).sort((a, b) => a.threshold - b.threshold);
-    // Apply all fixes iteratively, rechecking after each
     for (const rec of recommendations) {
       const target = s[rec.fix.sortedIdx];
       const oi = next.findIndex(t => t.threshold === target.threshold && t.type === target.type);
@@ -349,7 +338,6 @@ export default function App() {
                   const pk = sorted[k].type === "pct" ? sorted[k].value : (sorted[k].value / sorted[k].threshold) * 100;
                   if (pk > peakLower) peakLower = pk;
                 }
-                // Also check if any split in this tier's range beats single
                 const hasArbInRange = recommendations.some(r => r.tierIdx === i);
                 const issue = hasArbInRange || (i > 0 && peakLower > currEff);
                 return (
@@ -379,6 +367,77 @@ export default function App() {
               })}
             </tbody>
           </table>
+        </div>
+
+        {/* Explanation Toggle & Box */}
+        <div style={{ marginTop: 16 }}>
+          <button onClick={() => setShowExplanation(!showExplanation)} style={{
+            background: "#fff", border: "1px solid #e2e8f0", borderRadius: showExplanation ? "14px 14px 0 0" : 14,
+            padding: "14px 20px", cursor: "pointer", fontSize: 14, fontFamily: FONT, fontWeight: 600,
+            color: "#0f172a", width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 10,
+            boxShadow: "0 1px 3px rgba(0,0,0,0.04)", transition: "all 0.2s",
+          }}>
+            <span style={{ fontSize: 18 }}>📖</span>
+            <span>Tablo Nasıl Okunur?</span>
+            <span style={{
+              marginLeft: "auto", fontSize: 18, color: "#94a3b8",
+              transform: showExplanation ? "rotate(180deg)" : "rotate(0deg)",
+              transition: "transform 0.2s",
+            }}>▾</span>
+          </button>
+
+          {showExplanation && (
+            <div style={{
+              background: "#fff", border: "1px solid #e2e8f0", borderTop: "none",
+              borderRadius: "0 0 14px 14px", padding: "20px 24px",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+            }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16, fontSize: 13, color: "#475569", lineHeight: 1.8 }}>
+
+                <div style={{ display: "flex", gap: 12 }}>
+                  <div style={{ minWidth: 32, height: 32, borderRadius: 8, background: "#f0f9ff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0, marginTop: 2 }}>📌</div>
+                  <div>
+                    <strong style={{ color: "#0f172a" }}>Eff% (Efektif İndirim Oranı)</strong><br />
+                    Kademenin eşik tutarında sağladığı indirim yüzdesidir.
+                    Örneğin sabit 5.000 ₺ indirimli 60.000 ₺ eşik → 5.000 / 60.000 = <strong>%8.3</strong> efektif oran.
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", gap: 12 }}>
+                  <div style={{ minWidth: 32, height: 32, borderRadius: 8, background: "#fef3c7", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0, marginTop: 2 }}>⚖️</div>
+                  <div>
+                    <strong style={{ color: "#0f172a" }}>Maks Alt Eff% (Maksimum Alt Kademe Efektif Oranı)</strong><br />
+                    Bu kademenin <strong>altındaki</strong> tüm kademelerin en yüksek efektif indirim oranıdır.
+                    Yani müşteri bu kademeye ulaşmadan önceki kademelerden alabileceği en iyi oranı gösterir.
+                    Örneğin 120.000 ₺ kademesi için altında 60K (%8.3) ve 90K (%10.0) var → Maks Alt Eff% = <strong>%10.0</strong>.
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", gap: 12 }}>
+                  <div style={{ minWidth: 32, height: 32, borderRadius: 8, background: "#f0fdf4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0, marginTop: 2 }}>✅</div>
+                  <div>
+                    <strong style={{ color: "#0f172a" }}>Durum Kontrolü</strong><br />
+                    Kademenin kendi Eff% değeri, Maks Alt Eff% değerinden <strong>büyükse</strong> →{" "}
+                    <span style={{ background: "#f0fdf4", color: "#16a34a", padding: "1px 6px", borderRadius: 4, fontSize: 11, fontWeight: 600 }}>✅ OK</span>{" "}
+                    — müşteri sepeti bölerek avantaj sağlayamaz.<br />
+                    Eğer Eff% ≤ Maks Alt Eff% ise →{" "}
+                    <span style={{ background: "#fef2f2", color: "#dc2626", padding: "1px 6px", borderRadius: 4, fontSize: 11, fontWeight: 600 }}>⚠️ Risk</span>{" "}
+                    — müşteri sepetini bölerek daha yüksek efektif indirim elde edebilir.
+                  </div>
+                </div>
+
+                <div style={{ background: "#f8fafc", borderRadius: 10, padding: "14px 16px", border: "1px solid #f1f5f9", marginTop: 4 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.03em" }}>Örnek Senaryo</div>
+                  <div style={{ fontSize: 13, color: "#475569", lineHeight: 1.8 }}>
+                    90.000 ₺ kademe %10 efektif indirim sağlıyor, altındaki 60.000 ₺ kademe ise %8.3 efektif oran veriyor.{" "}
+                    <strong>%10 {">"} %8.3</strong> olduğu için <span style={{ color: "#16a34a", fontWeight: 600 }}>sorun yok</span> —
+                    müşteri 90.000 ₺'lik tek sepet yerine 60.000 + 30.000 ₺ diye bölse, toplamda daha az indirim alır.
+                    Eğer tersi olsaydı (üst kademe daha düşük oran verseydi), müşteri sepeti bölerek kazançlı çıkabilirdi.
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 16, lineHeight: 1.7, textAlign: "center" }}>
