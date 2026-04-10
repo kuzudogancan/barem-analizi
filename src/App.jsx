@@ -15,6 +15,13 @@ function getDiscount(amount, tiers) {
   return 0;
 }
 
+function getTierIndex(amount, tiers) {
+  for (let i = tiers.length - 1; i >= 0; i--) {
+    if (amount >= tiers[i].threshold) return i;
+  }
+  return -1;
+}
+
 function getBestSplit(amount, tiers) {
   let best = getDiscount(amount, tiers);
   let bestParts = null;
@@ -30,61 +37,63 @@ function getBestSplit(amount, tiers) {
   return { best, parts: bestParts };
 }
 
+// Scan all amounts brute-force, find worst arbitrage per affected tier
 function generateRecommendations(sorted) {
   if (sorted.length < 2) return [];
-  const issues = [];
-  const seen = new Set();
-  for (let j = 1; j < sorted.length; j++) {
-    let peakEff = 0, peakIdx = -1;
-    for (let i = 0; i < j; i++) {
-      const p = sorted[i].type === "pct" ? sorted[i].value / 100 : sorted[i].value / sorted[i].threshold;
-      if (p > peakEff) { peakEff = p; peakIdx = i; }
-    }
-    const currEff = sorted[j].type === "pct" ? sorted[j].value / 100 : sorted[j].value / sorted[j].threshold;
-    if (peakEff > currEff && peakIdx >= 0) {
-      const key = `${peakIdx}-${j}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        let fixAVal = sorted[j].type === "abs" ? Math.ceil(peakEff * sorted[j].threshold) : Math.ceil(peakEff * 1000) / 10;
-        let fixBVal = sorted[peakIdx].type === "abs" ? Math.floor(currEff * sorted[peakIdx].threshold) : Math.floor(currEff * 1000) / 10;
-        issues.push({
-          lowerTier: sorted[peakIdx], lowerIdx: peakIdx,
-          upperTier: sorted[j], upperIdx: j,
-          lowerPeakPct: (peakEff * 100).toFixed(1),
-          upperEffPct: (currEff * 100).toFixed(1),
-          fixA: { sortedIdx: j, newVal: fixAVal, label: sorted[j].type === "abs" ? `${fmt(fixAVal)} ₺` : `%${fixAVal}` },
-          fixB: { sortedIdx: peakIdx, newVal: fixBVal, label: sorted[peakIdx].type === "abs" ? `${fmt(fixBVal)} ₺` : `%${fixBVal}` },
-        });
-      }
-    }
-    // Also brute-force check doubles
-    for (let i = 0; i < j; i++) {
-      for (const testAmt of [sorted[i].threshold * 2, sorted[i].threshold * 3]) {
-        if (testAmt < sorted[j].threshold) continue;
-        const single = getDiscount(testAmt, sorted);
-        const { best } = getBestSplit(testAmt, sorted);
-        if (best > single + 1) {
-          const key = `${i}-${j}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            const pk = sorted[i].type === "pct" ? sorted[i].value / 100 : sorted[i].value / sorted[i].threshold;
-            const ce = sorted[j].type === "pct" ? sorted[j].value / 100 : sorted[j].value / sorted[j].threshold;
-            let fixAVal = sorted[j].type === "abs" ? Math.ceil(pk * sorted[j].threshold) : Math.ceil(pk * 1000) / 10;
-            let fixBVal = sorted[i].type === "abs" ? Math.floor(ce * sorted[i].threshold) : Math.floor(ce * 1000) / 10;
-            issues.push({
-              lowerTier: sorted[i], lowerIdx: i,
-              upperTier: sorted[j], upperIdx: j,
-              lowerPeakPct: (pk * 100).toFixed(1),
-              upperEffPct: (ce * 100).toFixed(1),
-              fixA: { sortedIdx: j, newVal: fixAVal, label: sorted[j].type === "abs" ? `${fmt(fixAVal)} ₺` : `%${fixAVal}` },
-              fixB: { sortedIdx: i, newVal: fixBVal, label: sorted[i].type === "abs" ? `${fmt(fixBVal)} ₺` : `%${fixBVal}` },
-            });
-          }
-        }
-      }
+
+  const maxAmt = Math.max(...sorted.map(t => t.threshold)) * 2.5;
+  const step = Math.max(1000, Math.round(maxAmt / 300));
+
+  // For each tier, track worst arbitrage case in that tier's range
+  const worstByTier = {};
+
+  for (let amt = step; amt <= maxAmt; amt += step) {
+    const singleDisc = getDiscount(amt, sorted);
+    const { best, parts } = getBestSplit(amt, sorted);
+    const diff = best - singleDisc;
+    if (diff <= 1 || !parts) continue;
+
+    const tierIdx = getTierIndex(amt, sorted);
+    if (tierIdx < 0) continue;
+
+    if (!worstByTier[tierIdx] || diff > worstByTier[tierIdx].diff) {
+      worstByTier[tierIdx] = { amt, diff, parts, singleDisc, bestDisc: best, tierIdx };
     }
   }
-  return issues;
+
+  return Object.values(worstByTier).map(w => {
+    const tier = sorted[w.tierIdx];
+    const splitEffRate = w.bestDisc / w.amt;
+
+    // Fix: what discount would this tier need so that single cart always wins?
+    // At the worst amount, single cart discount must be >= best split discount
+    // For abs tier: need value >= bestDisc (but that's for worst amount; really need value >= splitEffRate * threshold for threshold, and >= bestDisc for worst amount)
+    // Simpler: set discount so that eff rate at threshold >= max split eff rate observed
+    let fixVal;
+    if (tier.type === "abs") {
+      // Need: tier.value / amt >= splitEffRate for all amt in range
+      // Worst case is at the highest amt in range (lowest eff for abs)
+      // But we can't set value per-amount; we need value such that even at worst amount, single >= split
+      // value >= best split discount at worst amount
+      fixVal = Math.ceil(w.bestDisc);
+    } else {
+      // For pct: rate >= splitEffRate * 100
+      fixVal = Math.ceil(splitEffRate * 1000) / 10;
+    }
+
+    return {
+      tier, tierIdx: w.tierIdx,
+      worstAmt: w.amt, diff: w.diff, parts: w.parts,
+      singleDisc: w.singleDisc, bestDisc: w.bestDisc,
+      splitEffPct: (splitEffRate * 100).toFixed(1),
+      currentEffPct: (w.singleDisc / w.amt * 100).toFixed(1),
+      fix: {
+        sortedIdx: w.tierIdx,
+        newVal: fixVal,
+        label: tier.type === "abs" ? `${fmt(fixVal)} ₺` : `%${fixVal}`,
+      },
+    };
+  }).sort((a, b) => b.diff - a.diff);
 }
 
 const fmt = (n) => new Intl.NumberFormat("tr-TR").format(Math.round(n));
@@ -139,10 +148,11 @@ export default function App() {
   const autoFixAll = () => {
     const next = [...tiers];
     const s = [...next].filter(t => t.threshold > 0).sort((a, b) => a.threshold - b.threshold);
+    // Apply all fixes iteratively, rechecking after each
     for (const rec of recommendations) {
-      const target = s[rec.fixA.sortedIdx];
+      const target = s[rec.fix.sortedIdx];
       const oi = next.findIndex(t => t.threshold === target.threshold && t.type === target.type);
-      if (oi >= 0) { next[oi] = { ...next[oi], value: rec.fixA.newVal }; s[rec.fixA.sortedIdx] = next[oi]; }
+      if (oi >= 0) { next[oi] = { ...next[oi], value: rec.fix.newVal }; s[rec.fix.sortedIdx] = next[oi]; }
     }
     setTiers(next);
   };
@@ -242,7 +252,7 @@ export default function App() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
               <div>
                 <div style={{ fontWeight: 700, fontSize: 16, color: "#0f172a" }}>💡 Düzeltme Önerileri</div>
-                <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>Her sorun için iki alternatif — tıklayarak uygulayın</div>
+                <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>Her sorunlu kademe için minimum düzeltme — tıklayarak uygulayın</div>
               </div>
               <button onClick={autoFixAll} style={{
                 background: "linear-gradient(135deg, #059669, #047857)", border: "none",
@@ -259,31 +269,25 @@ export default function App() {
                 <div key={ri} style={{ background: "#fafbfc", border: "1px solid #f1f5f9", borderRadius: 12, padding: "16px" }}>
                   <div style={{ fontSize: 13, color: "#475569", marginBottom: 12, lineHeight: 1.7 }}>
                     <span style={{ background: "#fef2f2", color: "#dc2626", padding: "2px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600, marginRight: 6 }}>SORUN</span>
-                    <strong style={{ color: "#0f172a" }}>{fmt(rec.lowerTier.threshold)} ₺</strong> kademesi efektif{" "}
-                    <span style={{ color: "#dc2626", fontWeight: 600 }}>{fmtPct(Number(rec.lowerPeakPct))}</span> oran sağlıyor,{" "}
-                    <strong style={{ color: "#0f172a" }}>{fmt(rec.upperTier.threshold)} ₺</strong> kademesi ise sadece{" "}
-                    <span style={{ color: "#0284c7", fontWeight: 600 }}>{fmtPct(Number(rec.upperEffPct))}</span>
+                    <strong style={{ color: "#0f172a" }}>{fmt(rec.worstAmt)} ₺</strong> sepette{" "}
+                    <strong style={{ color: "#0f172a" }}>{fmt(rec.tier.threshold)} ₺</strong> kademesi{" "}
+                    <span style={{ color: "#0284c7", fontWeight: 600 }}>{fmt(rec.singleDisc)} ₺</span> indirim sağlıyor,
+                    ama <span style={{ color: "#dc2626", fontWeight: 600 }}>{fmt(rec.parts[0])} + {fmt(rec.parts[1])}</span> bölme ile{" "}
+                    <span style={{ color: "#dc2626", fontWeight: 600 }}>{fmt(rec.bestDisc)} ₺</span> alınabiliyor
+                    <span style={{ color: "#dc2626", fontWeight: 600 }}> (+{fmt(rec.diff)} ₺ arbitraj)</span>
                   </div>
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <button onClick={() => applyFix(rec.fixA)} style={{
-                      background: "#fff", border: "1px solid #d1fae5", borderRadius: 10, color: "#334155", padding: "12px 16px",
-                      cursor: "pointer", fontSize: 13, fontFamily: FONT, textAlign: "left", flex: 1, minWidth: 220, transition: "all 0.15s",
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = "#059669"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(5,150,105,0.1)"; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = "#d1fae5"; e.currentTarget.style.boxShadow = "none"; }}>
-                      <div style={{ color: "#059669", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>↑ Üst kademeyi yükselt</div>
-                      <div>{fmt(rec.upperTier.threshold)} ₺ indirimi → <strong style={{ color: "#059669" }}>{rec.fixA.label}</strong></div>
-                    </button>
-                    <button onClick={() => applyFix(rec.fixB)} style={{
-                      background: "#fff", border: "1px solid #fef3c7", borderRadius: 10, color: "#334155", padding: "12px 16px",
-                      cursor: "pointer", fontSize: 13, fontFamily: FONT, textAlign: "left", flex: 1, minWidth: 220, transition: "all 0.15s",
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = "#d97706"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(217,119,6,0.1)"; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = "#fef3c7"; e.currentTarget.style.boxShadow = "none"; }}>
-                      <div style={{ color: "#d97706", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>↓ Alt kademeyi düşür</div>
-                      <div>{fmt(rec.lowerTier.threshold)} ₺ indirimi → <strong style={{ color: "#d97706" }}>{rec.fixB.label}</strong></div>
-                    </button>
-                  </div>
+                  <button onClick={() => applyFix(rec.fix)} style={{
+                    background: "#fff", border: "1px solid #d1fae5", borderRadius: 10, color: "#334155", padding: "12px 16px",
+                    cursor: "pointer", fontSize: 13, fontFamily: FONT, textAlign: "left", width: "100%", transition: "all 0.15s",
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = "#059669"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(5,150,105,0.1)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = "#d1fae5"; e.currentTarget.style.boxShadow = "none"; }}>
+                    <div style={{ color: "#059669", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>↑ Düzeltme: {fmt(rec.tier.threshold)} ₺ kademesinin indirimini yükselt</div>
+                    <div>
+                      Mevcut: <span style={{ color: "#94a3b8" }}>{rec.tier.type === "abs" ? `${fmt(rec.tier.value)} ₺` : `%${rec.tier.value}`}</span>
+                      {" → "} Önerilen: <strong style={{ color: "#059669" }}>{rec.fix.label}</strong>
+                    </div>
+                  </button>
                 </div>
               ))}
             </div>
@@ -321,7 +325,7 @@ export default function App() {
           </ResponsiveContainer>
           <div style={{ display: "flex", gap: 24, justifyContent: "center", padding: "4px 0 4px", fontSize: 12 }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#64748b" }}><span style={{ width: 16, height: 3, background: "#0284c7", borderRadius: 2, display: "inline-block" }} /> Tek sepet</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#64748b" }}><span style={{ width: 16, height: 3, background: "#dc2626", borderRadius: 2, display: "inline-block", borderBottom: "1px dashed #dc2626" }} /> Bölme ile</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#64748b" }}><span style={{ width: 16, height: 3, background: "#dc2626", borderRadius: 2, display: "inline-block" }} /> Bölme ile</span>
           </div>
         </div>
 
@@ -345,7 +349,9 @@ export default function App() {
                   const pk = sorted[k].type === "pct" ? sorted[k].value : (sorted[k].value / sorted[k].threshold) * 100;
                   if (pk > peakLower) peakLower = pk;
                 }
-                const issue = i > 0 && peakLower > currEff;
+                // Also check if any split in this tier's range beats single
+                const hasArbInRange = recommendations.some(r => r.tierIdx === i);
+                const issue = hasArbInRange || (i > 0 && peakLower > currEff);
                 return (
                   <tr key={i} style={{ borderBottom: "1px solid #f8fafc" }}>
                     <td style={{ padding: "10px 14px", textAlign: "right", color: "#0f172a", fontWeight: 500 }}>{fmt(t.threshold)} ₺</td>
@@ -376,7 +382,8 @@ export default function App() {
         </div>
 
         <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 16, lineHeight: 1.7, textAlign: "center" }}>
-          "Maks Alt Eff%" bir alt kademedeki en yüksek efektif indirim oranıdır. Bu oran mevcut kademeyi aşıyorsa müşteri sepeti bölerek daha fazla indirim alabilir.
+          Arbitraj tespiti tüm olası sepet bölme kombinasyonlarını (tek kademe + çapraz kademe) tarar.
+          Öneri motoru her sorunlu kademe için minimum indirim artışını hesaplar.
         </p>
       </div>
     </div>
